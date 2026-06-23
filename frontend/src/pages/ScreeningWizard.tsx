@@ -1,0 +1,685 @@
+import { useState, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
+import { ArrowLeft, ArrowRight, Save, Loader2, CheckCircle2, AlertCircle, Sparkles, FastForward } from "lucide-react";
+import { Button } from "../components/ui/button";
+import { useAuth } from "../context/AuthContext";
+import { firestoreService } from "../services/firestoreService";
+import { riskUtils } from "../lib/riskUtils";
+
+import { WizardSteppers } from "../components/ui/wizard-steppers";
+import { InitialScanStep } from "../components/screening/InitialScanStep";
+import { PatientDemographicsForm } from "../components/screening/PatientDemographicsForm";
+import { VitalsEntryForm } from "../components/screening/VitalsEntryForm";
+import { LifestyleSurveyForm } from "../components/screening/LifestyleSurveyForm";
+import { LabResultsUploadForm } from "../components/screening/LabResultsUploadForm";
+import { RiskAssessmentReview } from "../components/screening/RiskAssessmentReview";
+import { AIAnalysisModal } from "../components/screening/AIAnalysisModal";
+import { motion } from "framer-motion";
+
+import { useToast } from "../context/ToastContext";
+import { translations } from "../lib/translations";
+
+export function ScreeningWizard() {
+    const { showToast } = useToast();
+    const [currentStep, setCurrentStep] = useState(0);
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [isSuccess, setIsSuccess] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [aiAnalysis, setAiAnalysis] = useState<any>(null);
+    const [isAiModalOpen, setIsAiModalOpen] = useState(false);
+    const [language, setLanguage] = useState<'en' | 'hi'>('hi'); // Default to Hindi as per request hint
+    const [nameMismatch, setNameMismatch] = useState<{ extracted: string; expected: string } | null>(null);
+    const [ocrExtractedName, setOcrExtractedName] = useState<string>("");
+    
+    const t = translations[language];
+
+    const wizardSteps = [
+        { label: t.step_ai_scan, description: t.desc_ai_scan },
+        { label: t.step_identity, description: t.desc_identity },
+        { label: t.step_vitals, description: t.desc_vitals },
+        { label: t.step_lifestyle, description: t.desc_lifestyle },
+        { label: t.step_lab, description: t.desc_lab },
+        { label: t.step_risk, description: t.desc_risk }
+    ];
+
+    const [formData, setFormData] = useState<any>({
+        // Patient
+        full_name: "",
+        age: "",
+        gender: "",
+        village: "",
+        phone: "",
+        // Vitals
+        height_cm: "",
+        weight_kg: "",
+        systolic_bp: "",
+        diastolic_bp: "",
+        heart_rate: "",
+        // Lifestyle
+        smoking_status: "",
+        alcohol_usage: "",
+        physical_activity: "",
+        // Lab
+        glucose_level: "",
+        cholesterol_level: "",
+        // Hematology
+        hemoglobin: "",
+        rbc_count: "",
+        wbc_count: "",
+        platelet_count: "",
+        // Metabolic
+        blood_urea_nitrogen: "",
+        creatinine: "",
+        sodium: "",
+        potassium: "",
+        chloride: "",
+        calcium: "",
+        // Liver
+        alt_sgpt: "",
+        ast_sgot: "",
+        albumin: "",
+        total_bilirubin: "",
+    });
+    const navigate = useNavigate();
+    const { user } = useAuth();
+    const isOnline = true; // Force online for UI rendering during migration
+
+    const updateFormData = (newData: any) => {
+        setFormData(newData);
+
+        // ODR Name Mismatch Check for health worker/officer:
+        // When patient name is typed/changed in demographics, compare against OCR-extracted name
+        if ((user?.role === 'health_worker' || user?.role === 'health_officer') && newData._ocr_extracted_name) {
+            const extractedName: string = newData._ocr_extracted_name.trim();
+            const typedName: string = (newData.full_name || "").trim();
+            const normalize = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+            if (extractedName && typedName) {
+                if (normalize(extractedName) !== normalize(typedName)) {
+                    setNameMismatch({ extracted: extractedName, expected: typedName });
+                } else {
+                    // Names match — clear mismatch but keep the verify notice (expected: "")
+                    setNameMismatch({ extracted: extractedName, expected: "" });
+                }
+            }
+        }
+    };
+
+    // Diagnostics: Log form data changes
+    useEffect(() => {
+        console.log("Form Data Updated:", formData);
+    }, [formData]);
+
+    const handleOcrData = (extractedData: any) => {
+        // Robust check: Support both {'success': true, 'data': {...}} and flat {...} responses
+        let incoming = extractedData.data || extractedData;
+        
+        // If the backend sent an explicit success: false, handle it
+        if (extractedData.success === false) {
+            console.error("AI Extraction Error:", extractedData.error || "Unknown error");
+            const errorMsg = language === 'en' 
+                ? `Extraction failed: ${extractedData.error || "Please try again"}` 
+                : `निकााल विफल: ${extractedData.error || "कृपया पुनः प्रयास करें"}`;
+            showToast(errorMsg, "error");
+            return;
+        }
+
+        console.log("Tesseract Raw Incoming:", incoming);
+
+        // Utility to flatten nested objects (so "Demographics.age" becomes just "age")
+        const flattenObject = (obj: any, parentKey = ''): any => {
+            let flattened: any = {};
+            for (let key in obj) {
+                if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                    // If the value is an object and not null, recurse
+                    if (typeof obj[key] === 'object' && obj[key] !== null && !Array.isArray(obj[key])) {
+                        const deeplyFlattened = flattenObject(obj[key], '');
+                        flattened = { ...flattened, ...deeplyFlattened };
+                    } else {
+                        flattened[key] = obj[key];
+                    }
+                }
+            }
+            return flattened;
+        };
+
+        const flatData = flattenObject(incoming);
+        console.log("Tesseract Flattened Data:", flatData);
+        
+        setFormData((prev: any) => {
+            const updated = { ...prev };
+            let hasAppliedData = false;
+            
+            // Use flatData for all mapping logic
+            Object.keys(flatData).forEach(key => {
+                const val = flatData[key];
+                if (val !== null && val !== undefined && val !== "" && val !== "null") {
+                    if (Object.prototype.hasOwnProperty.call(updated, key)) {
+                        updated[key] = String(val);
+                        hasAppliedData = true;
+                    }
+                }
+            });
+
+            // 2. Alias & Transformation Mapping
+            const aliases: Record<string, string> = {
+                "patient_name": "full_name",
+                "fullname": "full_name",
+                "patient": "full_name",
+                "height": "height_cm",
+                "weight": "weight_kg",
+                "pulse": "heart_rate",
+                "heartrate": "heart_rate",
+                "cholesterol": "cholesterol_level",
+                "glucose": "glucose_level"
+            };
+
+            Object.keys(aliases).forEach(aliasKey => {
+                const targetKey = aliases[aliasKey];
+                const val = flatData[aliasKey];
+                if (val && val !== "null" && !updated[targetKey]) {
+                    updated[targetKey] = String(val);
+                    hasAppliedData = true;
+                }
+            });
+
+            // 3. Special handling for Blood Pressure 
+            const bp = flatData.blood_pressure || flatData.bp || flatData.systolic_over_diastolic;
+            if (bp && typeof bp === 'string' && bp !== "null") {
+                const parts = bp.split(/[\/\s]+/).filter(p => !isNaN(parseInt(p)));
+                if (parts.length >= 2) {
+                    updated.systolic_bp = parts[0];
+                    updated.diastolic_bp = parts[1];
+                    hasAppliedData = true;
+                }
+            }
+            
+            if (!hasAppliedData) {
+                console.warn("OCR succeeded but no matching fields were found even after flattening.");
+            }
+
+            return updated;
+        });
+
+        const successMsg = language === 'en' 
+            ? "Data extracted successfully! Please verify details." 
+            : "डेटा सफलतापूर्वक निकाला गया! कृपया विवरण सत्यापित करें।";
+            
+        showToast(successMsg, "success");
+
+        // ODR Name Mismatch Check (all roles)
+        const extractedName: string = (flatData.full_name || flatData.patient_name || flatData.fullname || "").trim();
+        const normalize = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+
+        if (extractedName) {
+            setOcrExtractedName(extractedName);
+            setFormData((prev: any) => ({ ...prev, _ocr_extracted_name: extractedName }));
+
+            if (user?.role === 'patient') {
+                // Patient: compare against logged-in user's own name
+                const loggedInName = (user.full_name || user.displayName || "").trim();
+                if (loggedInName && normalize(extractedName) !== normalize(loggedInName)) {
+                    setNameMismatch({ extracted: extractedName, expected: loggedInName });
+                    showToast(
+                        language === 'en'
+                            ? `Report mismatch! Report is for "${extractedName}" but you are logged in as "${loggedInName}".`
+                            : `रिपोर्ट मेल नहीं खाती! रिपोर्ट "${extractedName}" के लिए है, लेकिन आप "${loggedInName}" के रूप में लॉग इन हैं।`,
+                        "error"
+                    );
+                } else {
+                    setNameMismatch(null);
+                }
+            } else {
+                // Health worker / officer: always show a verification banner with the OCR name.
+                // Mismatch fires when they type a different name at step 1.
+                // Set nameMismatch with extracted as both fields so the banner shows as a "verify" notice.
+                setNameMismatch({ extracted: extractedName, expected: "" });
+            }
+        }
+
+        // Move to Identity step for verification
+        setCurrentStep(1);
+    };
+
+    const handleSubmitOnline = async () => {
+        try {
+            // Step 1: Handle Patient Identity
+            let patientId = user?.uid;
+            let patientName = formData.full_name;
+
+            // If user is a health worker, they are creating a NEW patient record
+            // If user is a patient, they are screening THEMSELVES (use their own UID)
+            if (user?.role !== 'patient') {
+                const patientData = {
+                    full_name: formData.full_name,
+                    age: parseInt(formData.age) || 0,
+                    gender: formData.gender,
+                    village: formData.village,
+                    phone: formData.phone || undefined,
+                    health_worker_id: user?.uid
+                };
+                const newPatient = await firestoreService.addPatient(patientData);
+                patientId = newPatient.id;
+                console.log("New patient created:", newPatient);
+            } else {
+                console.log("Self-screening for patient:", patientId);
+                // Optionally update patient profile in 'users' or 'patients' here if needed
+            }
+
+            // Step 2: Calculate Risk (Client-side)
+            const riskResult = riskUtils.calculateRisk({
+                age: parseInt(formData.age) || 0,
+                systolic_bp: parseInt(formData.systolic_bp) || undefined,
+                diastolic_bp: parseInt(formData.diastolic_bp) || undefined,
+                smoking_status: formData.smoking_status
+            });
+
+            // BMI calculation removed as unused variable 'bmi'
+
+            // Step 3: Create screening in Firestore
+            const screeningData = {
+                patient_id: patientId!,
+                patient_name: patientName, // Denormalized
+                height_cm: parseFloat(formData.height_cm) || undefined,
+                weight_kg: parseFloat(formData.weight_kg) || undefined,
+                systolic_bp: parseInt(formData.systolic_bp) || undefined,
+                diastolic_bp: parseInt(formData.diastolic_bp) || undefined,
+                heart_rate: parseInt(formData.heart_rate) || undefined,
+                smoking_status: formData.smoking_status || undefined,
+                alcohol_usage: formData.alcohol_usage || undefined,
+                physical_activity: formData.physical_activity || undefined,
+                glucose_level: parseFloat(formData.glucose_level) || undefined,
+                cholesterol_level: parseFloat(formData.cholesterol_level) || undefined,
+
+                // Hematology
+                hemoglobin: parseFloat(formData.hemoglobin) || undefined,
+                rbc_count: parseFloat(formData.rbc_count) || undefined,
+                wbc_count: parseFloat(formData.wbc_count) || undefined,
+                platelet_count: parseFloat(formData.platelet_count) || undefined,
+
+                // Metabolic
+                blood_urea_nitrogen: parseFloat(formData.blood_urea_nitrogen) || undefined,
+                creatinine: parseFloat(formData.creatinine) || undefined,
+                sodium: parseFloat(formData.sodium) || undefined,
+                potassium: parseFloat(formData.potassium) || undefined,
+                chloride: parseFloat(formData.chloride) || undefined,
+                calcium: parseFloat(formData.calcium) || undefined,
+
+                // Liver
+                alt_sgpt: parseFloat(formData.alt_sgpt) || undefined,
+                ast_sgot: parseFloat(formData.ast_sgot) || undefined,
+                albumin: parseFloat(formData.albumin) || undefined,
+                total_bilirubin: parseFloat(formData.total_bilirubin) || undefined,
+
+                risk_score: riskResult.score,
+                risk_level: riskResult.level,
+                risk_notes: riskResult.notes,
+            };
+
+            const screening = await firestoreService.addScreening(screeningData);
+            console.log("Screening created:", screening);
+
+            // --- CRITICAL FIXES FOR DISPLAY & AI ---
+
+            // 1. Update Patient Stats (so they show up in Patient List)
+            try {
+                const currentPatient = await firestoreService.getPatient(patientId!);
+                const currentCount = (currentPatient as any)?.screening_count || 0;
+
+                await firestoreService.updatePatient(patientId!, {
+                    // @ts-ignore
+                    screening_count: currentCount + 1,
+                    latest_risk_level: riskResult.level
+                });
+            } catch (updateErr) {
+                console.error("Failed to update patient stats:", updateErr);
+            }
+
+            // --- Trigger Real Gemini AI Analysis ---
+            let aiSuccess = false;
+            try {
+                const analysisPayload = {
+                    ...screeningData,
+                    age: parseInt(formData.age) || 0,
+                    gender: formData.gender
+                };
+
+                const aiResponse = await fetch('/api/ai/analyze', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(analysisPayload)
+                });
+
+                if (aiResponse.ok) {
+                    const aiResult = await aiResponse.json();
+                    if (aiResult.success && aiResult.analysis) {
+                        setAiAnalysis({
+                            ...aiResult.analysis,
+                            risk_level: riskResult.level // Preserve local gravity
+                        });
+                        setIsAiModalOpen(true);
+                        aiSuccess = true;
+
+                        if (screening.id) {
+                            await firestoreService.updateScreening(screening.id, {
+                                ai_insights: aiResult.analysis
+                            });
+                        }
+                    }
+                }
+            } catch (aiErr) {
+                console.error("AI Analysis failed:", aiErr);
+            }
+
+            // Allow time for async updates (a bit hacky but ensures firestore syncs before redirect)
+            await new Promise(r => setTimeout(r, 500));
+
+            return aiSuccess;
+        } catch (err: any) {
+            throw err;
+        }
+    };
+
+    const handleSubmit = async () => {
+        setIsSubmitting(true);
+        setError(null);
+
+        try {
+            const hasAi = await handleSubmitOnline();
+            setIsSuccess(true);
+            showToast("Screening submitted successfully", "success");
+
+            // If AI failed or didn't trigger, navigate away after delay
+            if (!hasAi) {
+                setTimeout(() => {
+                    navigate("/dashboard");
+                }, 3000);
+            }
+        } catch (err: any) {
+            console.error("Submission error:", err);
+            const msg = err.message || "An error occurred while saving data";
+            setError(msg);
+            showToast(msg, "error");
+        } finally {
+            setIsSubmitting(false);
+        }
+    };
+
+    const nextStep = () => {
+        if (currentStep < wizardSteps.length - 1) {
+            setCurrentStep(c => c + 1);
+        } else {
+            handleSubmit();
+        }
+    };
+
+    const prevStep = () => {
+        if (currentStep > 0) setCurrentStep(c => c - 1);
+    };
+
+    // Render Step Content
+    const renderStep = () => {
+        if (isSuccess) {
+            return (
+                <div className="flex flex-col items-center justify-center h-full py-12 animate-in fade-in zoom-in duration-500">
+                    <div className="h-20 w-20 bg-green-500/20 text-green-400 rounded-full flex items-center justify-center mb-6">
+                        <CheckCircle2 className="h-10 w-10" />
+                    </div>
+                    <h2 className="text-2xl font-bold text-white mb-2">
+                        Screening Completed!
+                    </h2>
+                    <p className="text-slate-400 mb-6">
+                        Patient and screening data saved successfully.
+                    </p>
+
+                    {aiAnalysis && (
+                        <div className="w-full max-w-md glass-card rounded-xl p-6 border border-white/10 mt-4">
+                            <div className="flex items-center gap-2 mb-4">
+                                <Sparkles className="h-5 w-5 text-teal-400" />
+                                <h3 className="font-semibold text-white">AI Analysis Summary</h3>
+                            </div>
+                            <div className="space-y-3 text-sm">
+                                <div className="flex justify-between">
+                                    <span className="text-slate-400">Risk Level:</span>
+                                    <span className={`font-medium ${aiAnalysis.risk_level === 'High' ? 'text-red-400' :
+                                        aiAnalysis.risk_level === 'Medium' ? 'text-amber-400' :
+                                            'text-green-400'
+                                        }`}>{aiAnalysis.risk_level}</span>
+                                </div>
+                                {aiAnalysis.summary && (
+                                    <p className="text-slate-300">{aiAnalysis.summary.substring(0, 200)}...</p>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    <p className="text-slate-500 text-sm mt-6">Redirecting to dashboard...</p>
+                </div>
+            )
+        }
+
+        if (isSubmitting) {
+            return (
+                <div className="flex flex-col items-center justify-center h-full py-12 animate-in fade-in zoom-in duration-500">
+                    <div className="h-20 w-20 bg-teal-500/20 text-teal-400 rounded-full flex items-center justify-center mb-6">
+                        <Loader2 className="h-10 w-10 animate-spin" />
+                    </div>
+                    <h2 className="text-2xl font-bold text-white mb-2">
+                        {isOnline ? 'Saving & Analyzing...' : 'Saving Locally...'}
+                    </h2>
+                    <p className="text-slate-400 mb-8">
+                        {isOnline
+                            ? 'Gemini AI is analyzing patient vitals and lab reports...'
+                            : 'Saving data to your device for offline access...'}
+                    </p>
+
+                    <div className="w-full max-w-md h-2 bg-slate-800 rounded-full overflow-hidden">
+                        <div className="h-full bg-gradient-to-r from-teal-500 to-blue-500 animate-progress-indeterminate" />
+                    </div>
+                </div>
+            )
+        }
+
+        if (error) {
+            return (
+                <div className="flex flex-col items-center justify-center h-full py-12">
+                    <div className="h-20 w-20 bg-red-500/20 text-red-400 rounded-full flex items-center justify-center mb-6">
+                        <AlertCircle className="h-10 w-10" />
+                    </div>
+                    <h2 className="text-2xl font-bold text-white mb-2">Error Occurred</h2>
+                    <p className="text-red-400 mb-4">{error}</p>
+                    <Button onClick={() => setError(null)} variant="outline">
+                        Try Again
+                    </Button>
+                </div>
+            )
+        }
+
+        switch (currentStep) {
+            case 0:
+                return (
+                    <InitialScanStep 
+                        onDataExtracted={handleOcrData} 
+                        onSkip={() => { setNameMismatch(null); setOcrExtractedName(""); setCurrentStep(1); }} 
+                        language={language}
+                    />
+                );
+            case 1:
+                return <PatientDemographicsForm data={formData} updateData={updateFormData} language={language} />;
+            case 2:
+                return <VitalsEntryForm data={formData} updateData={updateFormData} language={language} />;
+            case 3:
+                return <LifestyleSurveyForm data={formData} updateData={updateFormData} language={language} />;
+            case 4:
+                return <LabResultsUploadForm 
+                    data={formData} 
+                    updateData={updateFormData} 
+                    language={language}
+                    patientName={formData.full_name}
+                    onNameMismatch={(extracted: string) => {
+                        const patientName = (formData.full_name || "").trim();
+                        if (extracted && patientName) {
+                            const normalize = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+                            if (normalize(extracted) !== normalize(patientName)) {
+                                setNameMismatch({ extracted, expected: patientName });
+                                showToast(
+                                    language === 'en'
+                                        ? `Report mismatch! Report is for "${extracted}" but patient is "${patientName}".`
+                                        : `रिपोर्ट मेल नहीं खाती! रिपोर्ट "${extracted}" के लिए है, लेकिन मरीज़ "${patientName}" हैं।`,
+                                    "error"
+                                );
+                            } else {
+                                setNameMismatch(null);
+                            }
+                        }
+                    }}
+                />;
+            case 5:
+                return <RiskAssessmentReview data={formData} language={language} />;
+            default:
+                return <div className="p-8 text-center text-slate-500">Coming Soon... Step {currentStep + 1}</div>;
+        }
+    }
+
+    return (
+        <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="max-w-5xl mx-auto space-y-6"
+        >
+            <div className="flex items-center gap-4 mb-4">
+                <Button variant="ghost" size="icon" onClick={() => navigate(-1)} className="text-slate-300 hover:text-white hover:bg-white/10">
+                    <ArrowLeft className="h-5 w-5" />
+                </Button>
+                <div className="flex-1">
+                    <h1 className="text-xl md:text-2xl font-bold text-white">{t.wizard_title}</h1>
+                    <p className="text-sm md:text-base text-slate-400">{t.wizard_subtitle}</p>
+                </div>
+                <div className="flex items-center bg-slate-800/50 rounded-xl p-1 border border-white/5">
+                    <Button
+                        variant={language === 'en' ? 'secondary' : 'ghost'}
+                        size="sm"
+                        onClick={() => setLanguage('en')}
+                        className={`text-xs h-8 px-3 rounded-lg transition-all ${language === 'en' ? 'bg-teal-500 text-white shadow-lg' : 'text-slate-400'}`}
+                    >
+                        EN
+                    </Button>
+                    <Button
+                        variant={language === 'hi' ? 'secondary' : 'ghost'}
+                        size="sm"
+                        onClick={() => setLanguage('hi')}
+                        className={`text-xs h-8 px-3 rounded-lg transition-all ${language === 'hi' ? 'bg-teal-500 text-white shadow-lg' : 'text-slate-400'}`}
+                    >
+                        हिन्दी
+                    </Button>
+                </div>
+            </div>
+
+            <div className="glass-card rounded-2xl shadow-xl overflow-hidden border border-white/5">
+                <div className="p-6">
+                    <WizardSteppers steps={wizardSteps} currentStep={currentStep} />
+                </div>
+                <div className="p-6 min-h-[400px]">
+                    {nameMismatch && nameMismatch.expected === "" && (
+                        // Verify notice for health worker/officer — OCR detected a name, ask them to confirm
+                        <div className="mb-4 p-4 bg-red-500/10 border border-red-500/30 rounded-xl text-sm">
+                            <div className="flex items-start gap-3">
+                                <AlertCircle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
+                                <div className="flex-1">
+                                    <p className="font-semibold text-red-300">
+                                        {language === 'en' ? 'Verify Patient Name' : 'मरीज़ का नाम सत्यापित करें'}
+                                    </p>
+                                    <p className="text-red-400/80 mt-1">
+                                        {language === 'en'
+                                            ? `Report detected patient name: "${nameMismatch.extracted}". Please confirm this matches the intended patient.`
+                                            : `रिपोर्ट में मरीज़ का नाम मिला: "${nameMismatch.extracted}"। कृपया पुष्टि करें कि यह सही मरीज़ है।`}
+                                    </p>
+                                </div>
+                                <button
+                                    onClick={() => setNameMismatch(null)}
+                                    className="text-red-500 hover:text-red-300 transition-colors text-lg leading-none shrink-0"
+                                    aria-label="Dismiss"
+                                >×</button>
+                            </div>
+                        </div>
+                    )}
+                    {nameMismatch && nameMismatch.expected !== "" && (
+                        // Mismatch warning — extracted name differs from patient/logged-in name
+                        <div className="mb-4 p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl text-sm">
+                            <div className="flex items-start gap-3">
+                                <AlertCircle className="h-5 w-5 text-amber-400 shrink-0 mt-0.5" />
+                                <div className="flex-1">
+                                    <p className="font-semibold text-amber-300">
+                                        {language === 'en' ? 'Report Mismatch Detected' : 'रिपोर्ट मेल नहीं खाती'}
+                                    </p>
+                                    <p className="text-amber-400/80 mt-1">
+                                        {language === 'en'
+                                            ? `Report is for "${nameMismatch.extracted}" but patient is "${nameMismatch.expected}". You may still proceed if this is intentional.`
+                                            : `रिपोर्ट "${nameMismatch.extracted}" के लिए है, लेकिन मरीज़ "${nameMismatch.expected}" हैं। यदि यह जानबूझकर है तो आप आगे बढ़ सकते हैं।`}
+                                    </p>
+                                </div>
+                                <button
+                                    onClick={() => setNameMismatch(null)}
+                                    className="text-amber-500 hover:text-amber-300 transition-colors text-lg leading-none shrink-0"
+                                    aria-label="Dismiss"
+                                >×</button>
+                            </div>
+                            <div className="flex gap-2 mt-3 ml-8">
+                                <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => setNameMismatch(null)}
+                                    className="border-amber-500/40 text-amber-400 hover:bg-amber-500/10 hover:text-amber-300 text-xs h-7"
+                                >
+                                    {language === 'en' ? 'Proceed Anyway' : 'फिर भी आगे बढ़ें'}
+                                </Button>
+                            </div>
+                        </div>
+                    )}
+                    {renderStep()}
+                </div>
+                <div className="p-6 border-t border-white/5 flex justify-between bg-black/20">
+                    {!isSubmitting && !isSuccess && !error && (
+                        <>
+                            <Button
+                                variant="ghost"
+                                onClick={prevStep}
+                                disabled={currentStep === 0}
+                                className="text-slate-300 hover:text-white hover:bg-white/10"
+                            >
+                                Back
+                            </Button>
+                            {/* Only show Next if not on Scan Step (which has its own flow) */}
+                            <Button
+                                onClick={nextStep}
+                                className="min-w-[120px] bg-gradient-to-r from-teal-500 to-blue-600 hover:from-teal-400 hover:to-blue-500 text-white border-0 shadow-lg shadow-teal-500/25 transition-all duration-300"
+                            >
+                                {currentStep === wizardSteps.length - 1 ? (
+                                    <>
+                                        <Save className="mr-2 h-4 w-4" />
+                                        {isOnline ? t.finish : t.save_offline}
+                                    </>
+                                ) : (
+                                    <>
+                                        {t.next} <ArrowRight className="ml-2 h-4 w-4" />
+                                    </>
+                                )}
+                            </Button>
+                        </>
+                    )}
+                </div>
+            </div>
+
+
+            <AIAnalysisModal
+                isOpen={isAiModalOpen}
+                onClose={() => {
+                    setIsAiModalOpen(false);
+                    navigate("/dashboard");
+                }}
+                analysis={aiAnalysis}
+                patientName={formData.full_name}
+                language={language}
+            />
+        </motion.div >
+    )
+}
